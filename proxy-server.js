@@ -74,7 +74,7 @@ const htmlContent = `
     <input type="text" class="search-bar" id="searchBar" placeholder="Search Google">
     <button class="submit-btn" id="searchBtn">Search</button>
   </div>
-  <iframe id="contentFrame" src="/proxy/https://www.google.com"></iframe>
+  <iframe id="contentFrame" src="/proxy/https/www.google.com"></iframe>
 
   <script>
     document.getElementById('goBtn').addEventListener('click', () => {
@@ -101,24 +101,41 @@ const htmlContent = `
       let url = document.getElementById('urlBar').value.trim();
       
       // Add protocol if missing
-      if (!/^https?:\\/\\//.test(url)) {
+      if (!/^https?:\/\//.test(url)) {
         url = 'https://' + url;
       }
       
-      document.getElementById('contentFrame').src = '/proxy/' + url;
+      // Parse URL to get components
+      try {
+        const urlObj = new URL(url);
+        const proxyUrl = `/proxy/${urlObj.protocol.replace(':', '')}/${urlObj.host}${urlObj.pathname}${urlObj.search}`;
+        document.getElementById('contentFrame').src = proxyUrl;
+      } catch (e) {
+        alert('Invalid URL format');
+      }
     }
 
     function searchGoogle() {
       const query = encodeURIComponent(document.getElementById('searchBar').value.trim());
-      document.getElementById('contentFrame').src = '/proxy/https://www.google.com/search?q=' + query;
+      document.getElementById('contentFrame').src = '/proxy/https/www.google.com/search?q=' + query;
     }
 
     // Update URL bar when iframe loads a new URL
     document.getElementById('contentFrame').addEventListener('load', () => {
       const frameSrc = document.getElementById('contentFrame').src;
       if (frameSrc.startsWith(window.location.origin + '/proxy/')) {
-        const actualUrl = frameSrc.replace(window.location.origin + '/proxy/', '');
-        document.getElementById('urlBar').value = actualUrl;
+        try {
+          // Extract the actual URL from the proxy URL
+          const proxyPath = frameSrc.replace(window.location.origin + '/proxy/', '');
+          const parts = proxyPath.split('/');
+          const protocol = parts[0] + ':';
+          const host = parts[1];
+          const path = '/' + parts.slice(2).join('/');
+          const actualUrl = `${protocol}//${host}${path}`;
+          document.getElementById('urlBar').value = actualUrl;
+        } catch (e) {
+          console.error('Error parsing proxy URL', e);
+        }
       }
     });
   </script>
@@ -131,25 +148,28 @@ fs.writeFileSync(path.join(publicDir, 'index.html'), htmlContent);
 // Serve static files
 app.use(express.static(publicDir));
 
-// Main proxy middleware
-app.use('/proxy/:proxyUrl(*)', (req, res, next) => {
-  const proxyUrl = req.params.proxyUrl;
+// Proxy middleware for fully qualified URLs
+app.use('/proxy/:protocol/:host/*', (req, res, next) => {
+  const protocol = req.params.protocol;
+  const host = req.params.host;
+  const fullUrl = `${protocol}://${host}/${req.params[0] || ''}`;
   
-  // Parse the target URL
-  let target;
-  try {
-    target = new URL(proxyUrl);
-  } catch (error) {
-    return res.status(400).send('Invalid URL format');
-  }
+  // Get query string if present
+  const queryString = Object.keys(req.query).length > 0 
+    ? '?' + new URLSearchParams(req.query).toString() 
+    : '';
 
+  const targetUrl = fullUrl + queryString;
+  
+  console.log(`Proxying to: ${targetUrl}`);
+  
   // Create a proxy for the specific request
   const proxy = createProxyMiddleware({
-    target: target.origin,
+    target: `${protocol}://${host}`,
     changeOrigin: true,
     pathRewrite: (path) => {
-      // Remove the '/proxy/https://example.com' part, keep the rest of the path
-      return path.replace(`/proxy/${target.origin}`, '') || '/';
+      // Extract the path after the host
+      return '/' + (req.params[0] || '') + queryString;
     },
     onProxyRes: (proxyRes, req, res) => {
       // Modify headers to handle CORS issues
@@ -158,6 +178,40 @@ app.use('/proxy/:proxyUrl(*)', (req, res, next) => {
       delete proxyRes.headers['X-Frame-Options'];
       delete proxyRes.headers['content-security-policy'];
       delete proxyRes.headers['Content-Security-Policy'];
+      
+      // HTML content modification to rewrite links
+      if (proxyRes.headers['content-type'] && proxyRes.headers['content-type'].includes('text/html')) {
+        let body = '';
+        const _write = res.write;
+        const _end = res.end;
+        
+        proxyRes.on('data', (chunk) => {
+          body += chunk;
+        });
+        
+        proxyRes.on('end', () => {
+          // Rewrite links in HTML
+          const modifiedBody = body
+            .replace(/href="http(s?):\/\//g, `href="/proxy/http$1://`)
+            .replace(/href="\/(?!proxy)/g, `href="/proxy/${protocol}://${host}/`)
+            .replace(/src="http(s?):\/\//g, `src="/proxy/http$1://`)
+            .replace(/src="\/(?!proxy)/g, `src="/proxy/${protocol}://${host}/`)
+            .replace(/action="http(s?):\/\//g, `action="/proxy/http$1://`)
+            .replace(/action="\/(?!proxy)/g, `action="/proxy/${protocol}://${host}/`)
+            .replace(/url\(http(s?):\/\//g, `url(/proxy/http$1://`)
+            .replace(/url\('http(s?):\/\//g, `url('/proxy/http$1://`)
+            .replace(/url\("http(s?):\/\//g, `url("/proxy/http$1://`)
+            .replace(/url\(\/(?!proxy)/g, `url(/proxy/${protocol}://${host}/`);
+          
+          // Send the modified HTML
+          _write.call(res, Buffer.from(modifiedBody));
+          _end.call(res);
+        });
+        
+        // Prevent original response from being sent
+        res.write = () => true;
+        res.end = () => true;
+      }
     },
     onError: (err, req, res) => {
       console.error('Proxy error:', err);
@@ -166,6 +220,28 @@ app.use('/proxy/:proxyUrl(*)', (req, res, next) => {
   });
 
   return proxy(req, res, next);
+});
+
+// Handle legacy format or direct URLs
+app.use('/proxy/:url(*)', (req, res) => {
+  let url = req.params.url;
+  
+  if (!url.includes('://')) {
+    url = 'https://' + url;
+  }
+  
+  try {
+    const urlObj = new URL(url);
+    const protocol = urlObj.protocol.replace(':', '');
+    const host = urlObj.host;
+    const pathname = urlObj.pathname || '/';
+    const search = urlObj.search || '';
+    
+    // Redirect to the new format
+    res.redirect(`/proxy/${protocol}/${host}${pathname}${search}`);
+  } catch (error) {
+    res.status(400).send('Invalid URL format');
+  }
 });
 
 // Default route
