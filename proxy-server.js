@@ -108,7 +108,7 @@ const htmlContent = `
       // Parse URL to get components
       try {
         const urlObj = new URL(url);
-        const proxyUrl = `/proxy/${urlObj.protocol.replace(':', '')}/${urlObj.host}${urlObj.pathname}${urlObj.search}`;
+        const proxyUrl = `/proxy/$urlObj.protocol.replace(':', '')}/${urlObj.host}${urlObj.pathname}${urlObj.search}`;
         document.getElementById('contentFrame').src = proxyUrl;
       } catch (e) {
         alert('Invalid URL format');
