@@ -101,14 +101,18 @@ const htmlContent = `
       let url = document.getElementById('urlBar').value.trim();
       
       // Add protocol if missing
-      if (!/^https?:\/\//.test(url)) {
+      if (!/^https?:\\/\\//.test(url)) {
         url = 'https://' + url;
       }
       
       // Parse URL to get components
       try {
         const urlObj = new URL(url);
-        const proxyUrl = `/proxy/${urlObj.protocol.replace(':', '')}/${urlObj.host}${urlObj.pathname}${urlObj.search}`;
+        const protocol = urlObj.protocol.replace(':', '');
+        const host = urlObj.host;
+        const pathname = urlObj.pathname || '';
+        const search = urlObj.search || '';
+        const proxyUrl = '/proxy/' + protocol + '/' + host + pathname + search;
         document.getElementById('contentFrame').src = proxyUrl;
       } catch (e) {
         alert('Invalid URL format');
@@ -128,10 +132,20 @@ const htmlContent = `
           // Extract the actual URL from the proxy URL
           const proxyPath = frameSrc.replace(window.location.origin + '/proxy/', '');
           const parts = proxyPath.split('/');
+          
+          // First part is the protocol (http or https)
           const protocol = parts[0] + ':';
+          
+          // Second part is the host
           const host = parts[1];
-          const path = '/' + parts.slice(2).join('/');
-          const actualUrl = `${protocol}//${host}${path}`;
+          
+          // Rest is the path (if any)
+          let path = '';
+          if (parts.length > 2) {
+            path = '/' + parts.slice(2).join('/');
+          }
+          
+          const actualUrl = protocol + '//' + host + path;
           document.getElementById('urlBar').value = actualUrl;
         } catch (e) {
           console.error('Error parsing proxy URL', e);
@@ -148,29 +162,13 @@ fs.writeFileSync(path.join(publicDir, 'index.html'), htmlContent);
 // Serve static files
 app.use(express.static(publicDir));
 
-// Proxy middleware for fully qualified URLs
-app.use('/proxy/:protocol/:host/*', (req, res, next) => {
-  const protocol = req.params.protocol;
-  const host = req.params.host;
-  const fullUrl = `${protocol}://${host}/${req.params[0] || ''}`;
-  
-  // Get query string if present
-  const queryString = Object.keys(req.query).length > 0 
-    ? '?' + new URLSearchParams(req.query).toString() 
-    : '';
-
-  const targetUrl = fullUrl + queryString;
-  
-  console.log(`Proxying to: ${targetUrl}`);
-  
-  // Create a proxy for the specific request
-  const proxy = createProxyMiddleware({
+// Function to create proxy middleware with consistent options
+function createProxyWithOptions(protocol, host, pathRewriter) {
+  return createProxyMiddleware({
     target: `${protocol}://${host}`,
     changeOrigin: true,
-    pathRewrite: (path) => {
-      // Extract the path after the host
-      return '/' + (req.params[0] || '') + queryString;
-    },
+    followRedirects: true,
+    pathRewrite: pathRewriter,
     onProxyRes: (proxyRes, req, res) => {
       // Modify headers to handle CORS issues
       proxyRes.headers['Access-Control-Allow-Origin'] = '*';
@@ -190,22 +188,28 @@ app.use('/proxy/:protocol/:host/*', (req, res, next) => {
         });
         
         proxyRes.on('end', () => {
-          // Rewrite links in HTML
-          const modifiedBody = body
-            .replace(/href="http(s?):\/\//g, `href="/proxy/http$1://`)
-            .replace(/href="\/(?!proxy)/g, `href="/proxy/${protocol}://${host}/`)
-            .replace(/src="http(s?):\/\//g, `src="/proxy/http$1://`)
-            .replace(/src="\/(?!proxy)/g, `src="/proxy/${protocol}://${host}/`)
-            .replace(/action="http(s?):\/\//g, `action="/proxy/http$1://`)
-            .replace(/action="\/(?!proxy)/g, `action="/proxy/${protocol}://${host}/`)
-            .replace(/url\(http(s?):\/\//g, `url(/proxy/http$1://`)
-            .replace(/url\('http(s?):\/\//g, `url('/proxy/http$1://`)
-            .replace(/url\("http(s?):\/\//g, `url("/proxy/http$1://`)
-            .replace(/url\(\/(?!proxy)/g, `url(/proxy/${protocol}://${host}/`);
-          
-          // Send the modified HTML
-          _write.call(res, Buffer.from(modifiedBody));
-          _end.call(res);
+          try {
+            // Rewrite links in HTML
+            const modifiedBody = body
+              .replace(/href="http(s?):\/\//g, `href="/proxy/http$1/`)
+              .replace(/href="\/(?!proxy)/g, `href="/proxy/${protocol}/${host}/`)
+              .replace(/src="http(s?):\/\//g, `src="/proxy/http$1/`)
+              .replace(/src="\/(?!proxy)/g, `src="/proxy/${protocol}/${host}/`)
+              .replace(/action="http(s?):\/\//g, `action="/proxy/http$1/`)
+              .replace(/action="\/(?!proxy)/g, `action="/proxy/${protocol}/${host}/`)
+              .replace(/url\(http(s?):\/\//g, `url(/proxy/http$1/`)
+              .replace(/url\('http(s?):\/\//g, `url('/proxy/http$1/`)
+              .replace(/url\("http(s?):\/\//g, `url("/proxy/http$1/`)
+              .replace(/url\(\/(?!proxy)/g, `url(/proxy/${protocol}/${host}/`);
+            
+            // Send the modified HTML
+            _write.call(res, Buffer.from(modifiedBody));
+            _end.call(res);
+          } catch (e) {
+            console.error('Error modifying response:', e);
+            _write.call(res, Buffer.from(body));
+            _end.call(res);
+          }
         });
         
         // Prevent original response from being sent
@@ -218,7 +222,29 @@ app.use('/proxy/:protocol/:host/*', (req, res, next) => {
       res.status(500).send('Proxy error: ' + err.message);
     }
   });
+}
 
+// Handle root requests to a domain (no path specified)
+app.use('/proxy/:protocol/:host', (req, res, next) => {
+  const protocol = req.params.protocol;
+  const host = req.params.host;
+  
+  console.log(`Proxying to: ${protocol}://${host}/`);
+  
+  const proxy = createProxyWithOptions(protocol, host, () => '/');
+  return proxy(req, res, next);
+});
+
+// Proxy middleware for fully qualified URLs with paths
+app.use('/proxy/:protocol/:host/*', (req, res, next) => {
+  const protocol = req.params.protocol;
+  const host = req.params.host;
+  const path = req.params[0];
+  
+  console.log(`Proxying to: ${protocol}://${host}/${path}`);
+  
+  // Create a proxy for the specific request
+  const proxy = createProxyWithOptions(protocol, host, () => '/' + path);
   return proxy(req, res, next);
 });
 
